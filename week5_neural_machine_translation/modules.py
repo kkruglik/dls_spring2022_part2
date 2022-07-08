@@ -62,15 +62,24 @@ class Attention(nn.Module):
         
         # encoder_outputs = [src sent len, batch size, enc_hid_dim]
         # hidden = [1, batch size, dec_hid_dim]
-        
+
         # repeat hidden and concatenate it with encoder_outputs
-        '''your code'''
+        attn_weights = F.softmax(
+            self.attn(torch.cat((encoder_outputs[0], hidden[0]), 1)), dim=1)
+
+        attn_applied = torch.bmm(attn_weights.unsqueeze(0),
+                                 encoder_outputs.unsqueeze(0))
+        
+        output = torch.cat((encoder_outputs[0], attn_applied[0]), 1)
+
         # calculate energy
         '''your code'''
+
         # get attention, use softmax function which is defined, can change temperature
+
         '''your code'''
             
-        return '''your code'''
+        return output
     
     
 class DecoderWithAttention(nn.Module):
@@ -83,7 +92,7 @@ class DecoderWithAttention(nn.Module):
         self.output_dim = output_dim
         self.attention = attention
         
-        self.embedding = '''your code'''
+        self.embedding = nn.Embedding(output_dim, emb_dim)
         
         self.rnn = '''your code''' # use GRU
         
@@ -106,6 +115,7 @@ class DecoderWithAttention(nn.Module):
         
         #embedded = [1, batch size, emb dim]
         
+
         # get weighted sum of encoder_outputs
         '''your code'''
         # concatenate weighted sum and embedded, break through the GRU
