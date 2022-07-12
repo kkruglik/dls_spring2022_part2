@@ -3,28 +3,42 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-def softmax(x, temperature=10): # use your temperature
-    e_x = torch.exp(x / temperature)
-    return e_x / torch.sum(e_x, dim=0)
-
 class Encoder(nn.Module):
-    def __init__(self, input_dim, emb_dim, enc_hid_dim, dec_hid_dim, dropout):
+    def __init__(self, input_dim, emb_dim, enc_hid_dim, dec_hid_dim, n_layers, dropout, bidirectional):
         super().__init__()
+        
         self.embedding = nn.Embedding(input_dim, emb_dim)
-        self.rnn = nn.GRU(emb_dim, enc_hid_dim, bidirectional = True)
+        
+        self.bidirectional = bidirectional
+        
+        self.rnn = nn.GRU(emb_dim, enc_hid_dim, n_layers, bidirectional = bidirectional)
+        
         self.fc = nn.Linear(enc_hid_dim * 2, dec_hid_dim)
+        
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, src):
+    def forward(self, src, src_len):
         
         #src = [src len, batch size]
+        #src_len = [batch size]
         
         embedded = self.dropout(self.embedding(src))
         
         #embedded = [src len, batch size, emb dim]
-        
-        outputs, hidden = self.rnn(embedded)
                 
+        #need to explicitly put lengths on cpu!
+        packed_embedded = nn.utils.rnn.pack_padded_sequence(embedded, src_len.to('cpu'))
+                
+        packed_outputs, hidden = self.rnn(packed_embedded)
+                                 
+        #packed_outputs is a packed sequence containing all hidden states
+        #hidden is now from the final non-padded element in the batch
+            
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_outputs) 
+            
+        #outputs is now a non-packed sequence, all hidden states obtained
+        #  when the input is a pad token are all zeros
+            
         #outputs = [src len, batch size, hid dim * num directions]
         #hidden = [n layers * num directions, batch size, hid dim]
         
@@ -43,6 +57,46 @@ class Encoder(nn.Module):
         
         return outputs, hidden
 
+def softmax(x, temperature=10): # use your temperature
+    e_x = torch.exp(x / temperature)
+    return e_x / torch.sum(e_x, dim=0)
+
+class Attention(nn.Module):
+    def __init__(self, enc_hid_dim, dec_hid_dim):
+        super().__init__()
+        
+        self.attn = nn.Linear((enc_hid_dim * 2) + dec_hid_dim, dec_hid_dim)
+        self.v = nn.Linear(dec_hid_dim, 1, bias = False)
+        
+    def forward(self, hidden, encoder_outputs, mask):
+        
+        #hidden = [batch size, dec hid dim]
+        #encoder_outputs = [src len, batch size, enc hid dim * 2]
+        
+        batch_size = encoder_outputs.shape[1]
+        src_len = encoder_outputs.shape[0]
+        
+        #repeat decoder hidden state src_len times
+        hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)
+  
+        encoder_outputs = encoder_outputs.permute(1, 0, 2)
+        
+        #hidden = [batch size, src len, dec hid dim]
+        #encoder_outputs = [batch size, src len, enc hid dim * 2]
+        
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim = 2))) 
+        
+        #energy = [batch size, src len, dec hid dim]
+
+        attention = self.v(energy).squeeze(2)
+        
+        #attention = [batch size, src len]
+        
+        attention = attention.masked_fill(mask == 0, -1e10)
+        
+        # return F.softmax(attention, dim = 1)
+        return softmax(attention)
+
 class Decoder(nn.Module):
     def __init__(self, output_dim, emb_dim, enc_hid_dim, dec_hid_dim, dropout, attention):
         super().__init__()
@@ -58,11 +112,12 @@ class Decoder(nn.Module):
         
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, input, hidden, encoder_outputs):
+    def forward(self, input, hidden, encoder_outputs, mask):
              
         #input = [batch size]
         #hidden = [batch size, dec hid dim]
         #encoder_outputs = [src len, batch size, enc hid dim * 2]
+        #mask = [batch size, src len]
         
         input = input.unsqueeze(0)
         
@@ -72,7 +127,7 @@ class Decoder(nn.Module):
         
         #embedded = [1, batch size, emb dim]
         
-        a = self.attention(hidden, encoder_outputs)
+        a = self.attention(hidden, encoder_outputs, mask)
                 
         #a = [batch size, src len]
         
@@ -115,22 +170,29 @@ class Decoder(nn.Module):
         
         #prediction = [batch size, output dim]
         
-        return prediction, hidden.squeeze(0)
+        return prediction, hidden.squeeze(0), a.squeeze(1)
 
 class Seq2Seq(nn.Module):
-    def __init__(self, encoder, decoder, device):
+    def __init__(self, encoder, decoder, src_pad_idx, device):
         super().__init__()
+        
         self.encoder = encoder
         self.decoder = decoder
+        self.src_pad_idx = src_pad_idx
         self.device = device
         
-    def forward(self, src, trg, teacher_forcing_ratio = 0.5):
+    def create_mask(self, src):
+        mask = (src != self.src_pad_idx).permute(1, 0)
+        return mask
+        
+    def forward(self, src, src_len, trg, teacher_forcing_ratio = 0.5):
         
         #src = [src len, batch size]
+        #src_len = [batch size]
         #trg = [trg len, batch size]
         #teacher_forcing_ratio is probability to use teacher forcing
         #e.g. if teacher_forcing_ratio is 0.75 we use teacher forcing 75% of the time
-        
+                    
         batch_size = src.shape[1]
         trg_len = trg.shape[0]
         trg_vocab_size = self.decoder.output_dim
@@ -140,16 +202,21 @@ class Seq2Seq(nn.Module):
         
         #encoder_outputs is all hidden states of the input sequence, back and forwards
         #hidden is the final forward and backward hidden states, passed through a linear layer
-        encoder_outputs, hidden = self.encoder(src)
+        encoder_outputs, hidden = self.encoder(src, src_len)
                 
         #first input to the decoder is the <sos> tokens
         input = trg[0,:]
         
+        mask = self.create_mask(src)
+
+        #mask = [batch size, src len]
+                
         for t in range(1, trg_len):
             
-            #insert input token embedding, previous hidden state and all encoder hidden states
+            #insert input token embedding, previous hidden state, all encoder hidden states 
+            #  and mask
             #receive output tensor (predictions) and new hidden state
-            output, hidden = self.decoder(input, hidden, encoder_outputs)
+            output, hidden, _ = self.decoder(input, hidden, encoder_outputs, mask)
             
             #place predictions in a tensor holding predictions for each token
             outputs[t] = output
@@ -163,5 +230,5 @@ class Seq2Seq(nn.Module):
             #if teacher forcing, use actual next token as next input
             #if not, use predicted token
             input = trg[t] if teacher_force else top1
-
+            
         return outputs
